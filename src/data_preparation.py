@@ -12,7 +12,7 @@ TESTA_DIR = os.path.join(BASE_DIR, 'testA')
 TESTB_DIR = os.path.join(BASE_DIR, 'testB')
 
 # 输出目录
-OUTPUT_DIR = 'processed_dataset'
+OUTPUT_DIR = 'yolov5_dataset'
 
 # 类别映射
 CLASS_MAP = {
@@ -25,7 +25,6 @@ CLASS_MAP = {
 # 有效类别
 VALID_CLASSES = set(CLASS_MAP.keys())
 
-
 def parse_xml_annotation(xml_path, img_width, img_height):
     """解析XML标注文件，过滤无效类别，并返回YOLO格式的标注"""
     try:
@@ -36,7 +35,7 @@ def parse_xml_annotation(xml_path, img_width, img_height):
         for obj in root.findall('object'):
             class_name = obj.find('name').text
 
-            # 过滤水草类别
+            # 过滤无效类别
             if class_name not in VALID_CLASSES:
                 continue
 
@@ -75,7 +74,6 @@ def parse_xml_annotation(xml_path, img_width, img_height):
     except Exception as e:
         print(f"解析XML错误 {xml_path}: {e}")
         return []
-
 
 def process_dataset(dataset_type, input_image_dir, input_box_dir, output_image_dir, output_label_dir):
     """处理单个数据集（训练集、测试集A或测试集B）"""
@@ -119,9 +117,8 @@ def process_dataset(dataset_type, input_image_dir, input_box_dir, output_image_d
     print(f"  -> 已处理 {processed_count} 张图像，跳过 {skipped_count} 张图像")
     return processed_count
 
-
 def create_dataset_yaml():
-    """创建YOLO数据集配置文件"""
+    """创建YOLOv5数据集配置文件"""
     yaml_content = {
         'path': os.path.abspath(OUTPUT_DIR),
         'train': 'train/images',
@@ -133,19 +130,6 @@ def create_dataset_yaml():
 
     with open(os.path.join(OUTPUT_DIR, 'underwater.yaml'), 'w') as f:
         yaml.dump(yaml_content, f, sort_keys=False)
-
-    # 创建单独的测试集配置文件
-    for test_set in ['testA', 'testB']:
-        test_yaml = {
-            'path': os.path.abspath(os.path.join(OUTPUT_DIR, test_set)),
-            'images': 'images',
-            'labels': 'labels',
-            'nc': len(CLASS_MAP),
-            'names': list(CLASS_MAP.keys())
-        }
-        with open(os.path.join(OUTPUT_DIR, f'{test_set}.yaml'), 'w') as f:
-            yaml.dump(test_yaml, f, sort_keys=False)
-
 
 def main():
     # 创建输出目录结构
@@ -192,7 +176,6 @@ def main():
     print(f"测试集B: {testb_count} 张图像")
     print(f"输出目录: {os.path.abspath(OUTPUT_DIR)}")
     print(f"数据集配置文件: {os.path.join(OUTPUT_DIR, 'underwater.yaml')}")
-
 
 if __name__ == "__main__":
     main()
