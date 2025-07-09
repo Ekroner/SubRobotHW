@@ -1,29 +1,30 @@
 import os
 import torch
-import torch.nn as nn
-from ultralytics import YOLO
-from ultralytics.nn.modules import Conv, C2f, SPPF, Detect
-from ultralytics.nn.tasks import DetectionModel
 import argparse
 import time
+from models.yolo import Model
+from utils.datasets import create_dataloader
+from utils.general import check_dataset, colorstr, increment_path
+from utils.torch_utils import select_device
+from utils.loss import ComputeLoss
+from utils.plots import plot_results
+import yaml
 
 
 # 自定义注意力模块
-class UnderwaterAttention(nn.Module):
-    """水下专用注意力机制"""
-
+class UnderwaterAttention(torch.nn.Module):
     def __init__(self, c1, reduction_ratio=8):
         super().__init__()
-        self.channel_att = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c1, c1 // reduction_ratio, 1),
-            nn.ReLU(),
-            nn.Conv2d(c1 // reduction_ratio, c1, 1),
-            nn.Sigmoid()
+        self.channel_att = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Conv2d(c1, c1 // reduction_ratio, 1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(c1 // reduction_ratio, c1, 1),
+            torch.nn.Sigmoid()
         )
-        self.spatial_att = nn.Sequential(
-            nn.Conv2d(c1, 1, kernel_size=3, padding=1),
-            nn.Sigmoid()
+        self.spatial_att = torch.nn.Sequential(
+            torch.nn.Conv2d(c1, 1, kernel_size=3, padding=1),
+            torch.nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -32,201 +33,164 @@ class UnderwaterAttention(nn.Module):
         return x * channel_att * spatial_att
 
 
-# 集成注意力的C2f模块
-class C2f_Underwater(C2f):
-    """集成水下注意力机制的C2f模块"""
-
+class C2f_Underwater(torch.nn.Module):
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = torch.nn.Conv2d(c1, 2 * self.c, 1, 1)
+        self.cv2 = torch.nn.Conv2d((2 + n) * self.c, c2, 1)
+        self.m = torch.nn.ModuleList(
+            torch.nn.Sequential(
+                torch.nn.Conv2d(self.c, self.c, 3, 1, 1, groups=g),
+                torch.nn.BatchNorm2d(self.c),
+                torch.nn.SiLU()
+            ) for _ in range(n))
         self.attention = UnderwaterAttention(c2)
+        self.shortcut = shortcut
 
     def forward(self, x):
-        return self.attention(super().forward(x))
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.attention(self.cv2(torch.cat(y, 1)))
 
 
-# 集成注意力的SPPF模块
-class SPPF_Underwater(SPPF):
-    """集成水下注意力机制的SPPF模块"""
-
+class SPPF_Underwater(torch.nn.Module):
     def __init__(self, c1, c2, k=5):
-        super().__init__(c1, c2, k)
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = torch.nn.Conv2d(c1, c_, 1, 1)
+        self.cv2 = torch.nn.Conv2d(c_ * 4, c2, 1, 1)
+        self.m = torch.nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
         self.attention = UnderwaterAttention(c2)
 
     def forward(self, x):
-        return self.attention(super().forward(x))
+        x = self.cv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        return self.attention(self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1)))
 
 
-# 模型配置文件
-def create_model_yaml():
-    """创建自定义模型配置文件"""
-    yaml_content = """
-# YOLOv8 水下专用模型
-backbone:
-  # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4
-  - [-1, 3, C2f_Underwater, [128]]  # 2
-  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8
-  - [-1, 6, C2f_Underwater, [256]]  # 4
-  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
-  - [-1, 6, C2f_Underwater, [512]]  # 6
-  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
-  - [-1, 3, C2f_Underwater, [1024]]  # 8
-  - [-1, 1, SPPF_Underwater, [1024, 5]]  # 9
-
-head:
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
-  - [[-1, 6], 1, Concat, [1]]  # cat backbone P4
-  - [-1, 3, C2f_Underwater, [512]]  # 12
-
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
-  - [[-1, 4], 1, Concat, [1]]  # cat backbone P3
-  - [-1, 3, C2f_Underwater, [256]]  # 15 (P3/8-small)
-
-  - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 12], 1, Concat, [1]]  # cat head P4
-  - [-1, 3, C2f_Underwater, [512]]  # 18 (P4/16-medium)
-
-  - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 9], 1, Concat, [1]]  # cat head P5
-  - [-1, 3, C2f_Underwater, [1024]]  # 21 (P5/32-large)
-
-  - [[15, 18, 21], 1, Detect, [nc]]  # Detect(P3, P4, P5)
-"""
-    model_yaml_path = 'underwater-yolov8.yaml'
-    with open(model_yaml_path, 'w') as f:
-        f.write(yaml_content.strip())
-    return model_yaml_path
+def create_custom_model(cfg='models/yolov5s.yaml', nc=4):
+    from models.common import Bottleneck
+    from models.yolo import Detect
+    setattr(torch.nn, 'C2f_Underwater', C2f_Underwater)
+    setattr(torch.nn, 'SPPF_Underwater', SPPF_Underwater)
+    setattr(torch.nn, 'UnderwaterAttention', UnderwaterAttention)
+    with open(cfg) as f:
+        model_yaml = yaml.safe_load(f)
+    for i, layer in enumerate(model_yaml['backbone']):
+        if layer[-1] == 'C2f':
+            model_yaml['backbone'][i][-1] = 'C2f_Underwater'
+        elif layer[-1] == 'SPPF':
+            model_yaml['backbone'][i][-1] = 'SPPF_Underwater'
+    model = Model(model_yaml, ch=3, nc=nc)
+    return model
 
 
-class NoiseRobustTrainer:
-    def __init__(self, model, data_config, noise_ratio=0.3):
-        self.model = model
-        self.data_config = data_config
-        self.noise_ratio = noise_ratio
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.output_dir = 'runs/detect'
+def train(hyp, opt, device):
+    save_dir = increment_path('runs/train/exp')
+    os.makedirs(save_dir, exist_ok=True)
+    data_dict = check_dataset(opt.data)
+    train_path = data_dict['train']
+    val_path = data_dict['val']
+    nc = int(data_dict['nc'])
+    names = data_dict['names']
 
-    def train(self, epochs=200, batch_size=16):
-        """噪声鲁棒训练循环"""
-        # 注册自定义模块
-        DetectionModel.modules['C2f_Underwater'] = C2f_Underwater
-        DetectionModel.modules['SPPF_Underwater'] = SPPF_Underwater
-        DetectionModel.modules['UnderwaterAttention'] = UnderwaterAttention
+    train_loader, dataset = create_dataloader(train_path, opt.imgsz, opt.batch_size, stride=32,
+                                              hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect,
+                                              workers=opt.workers, prefix=colorstr('train: '))
+    val_loader = create_dataloader(val_path, opt.imgsz, opt.batch_size * 2, stride=32,
+                                    hyp=hyp, cache=opt.cache, rect=True,
+                                    workers=opt.workers, prefix=colorstr('val: '))[0]
 
-        # 初始训练阶段（使用所有数据）
-        print("阶段1: 初始训练 (10% 轮次)")
-        self.model.train(
-            data=self.data_config,
-            epochs=int(epochs * 0.1),
-            imgsz=640,
-            batch=batch_size,
-            name='underwater_initial',
-            project=self.output_dir,
-            optimizer='AdamW',
-            lr0=0.001,
-            cos_lr=True,
-            hsv_h=0.015,  # 色调增强
-            hsv_s=0.7,  # 饱和度增强
-            hsv_v=0.4,  # 亮度增强
-            translate=0.1,
-            scale=0.5,
-            fliplr=0.5,
-            mosaic=1.0
-        )
+    model = create_custom_model(nc=nc).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=hyp['lr0'], weight_decay=hyp['weight_decay'])
+    compute_loss = ComputeLoss(model)
 
-        # 主训练阶段
-        print("阶段2: 主训练 (90% 轮次)")
-        for epoch in range(int(epochs * 0.1), epochs):
-            # 每10个epoch保存一次
-            save = (epoch % 10 == 0) or (epoch == epochs - 1)
+    best_fitness = 0.0
+    for epoch in range(opt.epochs):
+        model.train()
+        lr = hyp['lr0'] * (1 - epoch / opt.epochs)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-            # 训练一个epoch
-            self.model.train(
-                data=self.data_config,
-                epochs=1,
-                imgsz=640,
-                batch=batch_size,
-                resume=True,
-                name=f'underwater_epoch_{epoch}',
-                project=self.output_dir,
-                optimizer='AdamW',
-                lr0=0.001 * (1 - epoch / epochs),  # 学习率衰减
-                cos_lr=False,
-                save=save,
-                hsv_h=0.01,  # 减少增强强度
-                hsv_s=0.6,
-                hsv_v=0.3
-            )
+        for i, (imgs, targets, paths, _) in enumerate(train_loader):
+            imgs = imgs.to(device, non_blocking=True).float() / 255.0
+            targets = targets.to(device)
+            pred = model(imgs)
+            loss, loss_items = compute_loss(pred, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if i % 50 == 0:
+                print(f'Epoch: {epoch}/{opt.epochs} | Batch: {i}/{len(train_loader)} | '
+                      f'Loss: {loss.item():.4f} | lr: {lr:.6f}')
 
-            # 每10个epoch验证一次
-            if epoch % 10 == 0:
-                metrics = self.model.val()
-                print(f"Epoch {epoch}: mAP50={metrics.box.map50:.4f}, mAP50-95={metrics.box.map:.4f}")
+        if epoch % 10 == 0 or epoch == opt.epochs - 1:
+            results = validate(model, val_loader, compute_loss, device)
+            fitness = results[2]
+            if fitness > best_fitness:
+                best_fitness = fitness
+                torch.save(model.state_dict(), os.path.join(save_dir, 'best.pt'))
+            plot_results(save_dir=save_dir)
 
-                # 在测试集上评估
-                self.evaluate_on_test_sets()
+    test_path = data_dict['test']
+    test_loader = create_dataloader(test_path, opt.imgsz, opt.batch_size * 2, stride=32,
+                                     hyp=hyp, cache=opt.cache, rect=True,
+                                     workers=opt.workers, prefix=colorstr('test: '))[0]
+    results = validate(model, test_loader, compute_loss, device)
+    print(f"\u6d4b\u8bd5\u96c6\u7ed3\u679c: mAP@0.5={results[2]:.4f}, mAP@0.5:0.95={results[3]:.4f}")
+    export_model(model, save_dir)
+    return model
 
-    def evaluate_on_test_sets(self):
-        """在测试集A和B上评估模型"""
-        # 测试集A评估
-        print("在测试集A上评估模型...")
-        metrics_a = self.model.val(data=os.path.join(os.path.dirname(self.data_config), 'testA.yaml'))
-        print(f"测试集A: mAP50={metrics_a.box.map50:.4f}, mAP50-95={metrics_a.box.map:.4f}")
 
-        # 测试集B评估
-        print("在测试集B上评估模型...")
-        metrics_b = self.model.val(data=os.path.join(os.path.dirname(self.data_config), 'testB.yaml'))
-        print(f"测试集B: mAP50={metrics_b.box.map50:.4f}, mAP50-95={metrics_b.box.map:.4f}")
+def validate(model, dataloader, compute_loss, device):
+    model.eval()
+    results = [0.0] * 4
+    with torch.no_grad():
+        for i, (imgs, targets, paths, shapes) in enumerate(dataloader):
+            imgs = imgs.to(device, non_blocking=True).float() / 255.0
+            targets = targets.to(device)
+            pred = model(imgs)
+            loss, loss_items = compute_loss(pred, targets)
+            results[0] = (results[0] * i + loss.item()) / (i + 1)
+    return results
 
-        return metrics_a, metrics_b
+
+def export_model(model, save_dir):
+    example = torch.rand(1, 3, 640, 640).to(next(model.parameters()).device)
+    torch.onnx.export(model, example, os.path.join(save_dir, 'best.onnx'),
+                      opset_version=12, input_names=['images'], output_names=['output'],
+                      dynamic_axes={'images': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
+    print(f"\u6a21\u578b\u5df2\u5bfc\u51fa\u4e3aONNX\u683c\u5f0f: {os.path.join(save_dir, 'best.onnx')}")
 
 
 def main():
-    # 创建模型配置文件
-    model_yaml_path = create_model_yaml()
-
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description='水下目标检测模型训练')
-    parser.add_argument('--data', type=str, default='processed_dataset/underwater.yaml', help='数据集配置')
-    parser.add_argument('--epochs', type=int, default=200, help='训练轮数')
-    parser.add_argument('--batch-size', type=int, default=16, help='批次大小')
-    parser.add_argument('--noise-ratio', type=float, default=0.3, help='噪声数据比例')
-    args = parser.parse_args()
-
-    # 检查数据集配置是否存在
-    if not os.path.exists(args.data):
-        print(f"错误: 数据集配置文件 {args.data} 不存在!")
-        print("请先运行 data_preparation.py 进行数据预处理")
-        return
-
-    # 加载模型
-    print(f"创建自定义模型: {model_yaml_path}")
-    model = YOLO(model_yaml_path)
-
-    # 创建噪声鲁棒训练器
-    trainer = NoiseRobustTrainer(
-        model=model,
-        data_config=args.data,
-        noise_ratio=args.noise_ratio
-    )
-
-    # 开始训练
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, default='yolov5_dataset/underwater.yaml', help='\u6570\u636e\u96c6\u914d\u7f6e\u8def\u5f84')
+    parser.add_argument('--epochs', type=int, default=200, help='\u8bad\u7ec3\u8f6e\u6570')
+    parser.add_argument('--batch-size', type=int, default=16, help='\u6279\u6b21\u5927\u5c0f')
+    parser.add_argument('--imgsz', '--img', type=int, default=640, help='\u56fe\u50cf\u5927\u5c0f')
+    parser.add_argument('--device', default='', help='cuda\u8bbe\u5907')
+    parser.add_argument('--workers', type=int, default=8, help='\u6570\u636e\u52a0\u8f7d\u7ebf\u7a0b\u6570')
+    parser.add_argument('--cache', type=str, nargs='?', const='ram', help='\u56fe\u50cf\u7f13\u5b58')
+    parser.add_argument('--rect', action='store_true', help='\u77e9\u5f62\u8bad\u7ec3')
+    opt = parser.parse_args()
+    device = select_device(opt.device)
+    hyp = {
+        'lr0': 0.001, 'momentum': 0.937, 'weight_decay': 0.0005,
+        'warmup_epochs': 3.0, 'warmup_momentum': 0.8, 'warmup_bias_lr': 0.1,
+        'box': 0.05, 'cls': 0.5, 'cls_pw': 1.0, 'obj': 1.0, 'obj_pw': 1.0,
+        'fl_gamma': 0.0, 'hsv_h': 0.015, 'hsv_s': 0.7, 'hsv_v': 0.4,
+        'degrees': 0.0, 'translate': 0.1, 'scale': 0.5, 'shear': 0.0,
+        'perspective': 0.0, 'flipud': 0.0, 'fliplr': 0.5,
+        'mosaic': 1.0, 'mixup': 0.0,
+    }
     start_time = time.time()
-    trainer.train(epochs=args.epochs, batch_size=args.batch_size)
-
-    # 最终评估
-    print("\n最终模型评估:")
-    metrics_a, metrics_b = trainer.evaluate_on_test_sets()
-
-    # 导出模型
-    model.export(format='onnx', simplify=True, dynamic=True)
-
+    model = train(hyp, opt, device)
     training_time = time.time() - start_time
-    print(
-        f"\n模型训练完成! 总耗时: {training_time // 3600:.0f}h {(training_time % 3600) // 60:.0f}m {training_time % 60:.0f}s")
-    print(f"模型已导出为ONNX格式: {os.path.join(trainer.output_dir, 'train', 'weights', 'best.onnx')}")
+    print(f"\u8bad\u7ec3\u5b8c\u6210! \u603b\u8017\u65f6: {training_time // 3600:.0f}h {(training_time % 3600) // 60:.0f}m {training_time % 60:.0f}s")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
