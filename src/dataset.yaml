@@ -1,0 +1,12 @@
+# dataset.yaml
+train: ./data/train/image
+val: ./data/testA/image   # 验证集用TestA，训练时默认用val做验证
+test: ./data/testB/image
+
+nc: 4
+
+names:
+  - holothurian
+  - echinus
+  - scallop
+  - starfish
