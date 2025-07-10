@@ -48,7 +48,7 @@ def voc_to_yolo(xml_dir, label_out_dir):
     print(f"Saved labels to {label_out_dir}")
 
 def main():
-    base_dir = './data'
+    base_dir = '../data'
     sets = ['train', 'testA', 'testB']
 
     for s in sets:
