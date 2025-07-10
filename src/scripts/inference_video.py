@@ -1,9 +1,12 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import torch
 import argparse
 import time
 import os
+from models.experimental import attempt_load
+from utils.general import non_max_suppression, scale_coords
+from utils.torch_utils import select_device
 
 # 水下目标类别
 CLASSES = ['holothurian', 'echinus', 'scallop', 'starfish']
@@ -19,15 +22,16 @@ COLOR_MAP = {
 
 class UnderwaterVideoProcessor:
     def __init__(self, model_path, classes, device='cuda'):
-        self.model = YOLO(model_path)
-        self.model.to(device)
+        self.device = select_device(device)
+        self.model = attempt_load(model_path, map_location=self.device)
+        self.model.eval()
         self.classes = classes
-        self.device = device
         self.frame_count = 0
         self.detection_count = 0
         self.frame_times = []
         self.fps = 0
         self.last_log_time = time.time()
+        self.stride = int(self.model.stride.max())  # 模型步长
 
     def underwater_color_correction(self, frame):
         """水下颜色校正"""
@@ -60,6 +64,32 @@ class UnderwaterVideoProcessor:
         sharpened = cv2.filter2D(frame, -1, kernel)
         return sharpened
 
+    def preprocess(self, img, img_size=640):
+        """图像预处理"""
+        # 调整大小并保持宽高比
+        h, w = img.shape[:2]
+        r = min(img_size / h, img_size / w)
+        new_h, new_w = int(h * r), int(w * r)
+
+        # 调整大小
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # 填充
+        top = (img_size - new_h) // 2
+        bottom = img_size - new_h - top
+        left = (img_size - new_w) // 2
+        right = img_size - new_w - left
+        padded = cv2.copyMakeBorder(
+            resized, top, bottom, left, right,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114)
+        )
+
+        # 转换为模型输入格式
+        tensor = torch.from_numpy(padded).permute(2, 0, 1).float() / 255.0
+        tensor = tensor.unsqueeze(0).to(self.device)
+
+        return tensor, (h, w), (new_h, new_w), (top, left)
+
     def process_frame(self, frame):
         """处理单个视频帧"""
         start_time = time.time()
@@ -69,36 +99,35 @@ class UnderwaterVideoProcessor:
         enhanced_frame = self.enhance_blurry_objects(color_corrected)
 
         # 目标检测
-        results = self.model.predict(
-            enhanced_frame,
-            conf=0.4,
-            imgsz=640,
-            augment=False,
-            verbose=False
-        )
+        tensor, orig_shape, new_shape, pad = self.preprocess(enhanced_frame)
+
+        with torch.no_grad():
+            pred = self.model(tensor, augment=False)[0]
+            pred = non_max_suppression(pred, conf_thres=0.4, iou_thres=0.5)
 
         # 可视化结果
         frame_detections = 0
-        for result in results:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            confs = result.boxes.conf.cpu().numpy()
-            cls_ids = result.boxes.cls.cpu().numpy().astype(int)
+        for det in pred:
+            if len(det):
+                # 调整坐标到原始图像尺寸
+                det[:, :4] = scale_coords(tensor.shape[2:], det[:, :4], orig_shape, pad, new_shape)
 
-            for box, conf, cls_id in zip(boxes, confs, cls_ids):
-                if cls_id < len(self.classes):
-                    class_name = self.classes[cls_id]
-                    color = COLOR_MAP.get(class_name, (0, 255, 255))
+                for *xyxy, conf, cls in det:
+                    cls_id = int(cls)
+                    if cls_id < len(self.classes):
+                        class_name = self.classes[cls_id]
+                        color = COLOR_MAP.get(class_name, (0, 255, 255))
 
-                    # 绘制边界框
-                    x1, y1, x2, y2 = map(int, box)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        # 绘制边界框
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                    # 绘制标签
-                    label = f"{class_name} {conf:.2f}"
-                    cv2.putText(frame, label, (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        # 绘制标签
+                        label = f"{class_name} {conf:.2f}"
+                        cv2.putText(frame, label, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                    frame_detections += 1
+                        frame_detections += 1
 
         # 更新检测计数
         self.detection_count += frame_detections
@@ -204,8 +233,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='水下目标检测视频处理')
     parser.add_argument('--input', type=str, required=True, help='输入视频路径')
     parser.add_argument('--output', type=str, required=True, help='输出视频路径')
-    parser.add_argument('--model', type=str, default='runs/detect/train/weights/best.onnx',
-                        help='模型路径 (默认: runs/detect/train/weights/best.onnx)')
+    parser.add_argument('--model', type=str, default='runs/train/exp/weights/best.pt',
+                        help='模型路径 (默认: runs/train/exp/weights/best.pt)')
+    parser.add_argument('--device', default='cuda', help='cuda设备, 如 0 或 0,1,2,3 或 cpu')
 
     args = parser.parse_args()
 
@@ -218,7 +248,8 @@ if __name__ == "__main__":
     # 创建处理器
     processor = UnderwaterVideoProcessor(
         model_path=args.model,
-        classes=CLASSES
+        classes=CLASSES,
+        device=args.device
     )
 
     # 处理视频
